@@ -1,0 +1,9 @@
+venv/
+cowrie-env/
+__pycache__/
+*.pyc
+data/logs/
+data/reports/
+data/parsed/
+*.json
+.env

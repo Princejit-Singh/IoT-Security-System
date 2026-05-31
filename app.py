@@ -1,0 +1,385 @@
+"""
+IoT Honeypot GUI — Flask Backend
+Handles: Cowrie start/stop, log upload, AI analysis, live logs, dashboard, report download
+"""
+
+import os, json, subprocess, threading, time
+from pathlib import Path
+from collections import defaultdict
+from datetime import datetime
+from flask import Flask, render_template, jsonify, request, Response, send_file
+import google.generativeai as genai
+
+app = Flask(__name__)
+
+# ── Paths ─────────────────────────────────────────────────────
+BASE_DIR     = Path(__file__).parent
+DATA_DIR     = BASE_DIR / "data"
+LOG_DIR      = DATA_DIR / "logs"
+REPORT_DIR   = DATA_DIR / "reports"
+PARSED_DIR   = DATA_DIR / "parsed"
+COWRIE_PATH  = Path("/home/kali/cowrie")
+COWRIE_LOG   = COWRIE_PATH / "var/log/cowrie/cowrie.json"
+
+for d in [LOG_DIR, REPORT_DIR, PARSED_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+# ── State ─────────────────────────────────────────────────────
+cowrie_status = {"running": False, "pid": None, "started": None}
+live_log_lines = []          # Buffer for live log viewer
+analysis_result = {"report": "", "stats": {}, "done": False, "error": ""}
+
+# ── Helpers ───────────────────────────────────────────────────
+def parse_cowrie_json(filepath):
+    """Parse cowrie.json and return structured session data + stats."""
+    sessions   = defaultdict(lambda: {
+        "src_ip": None, "commands": [], "passwords": [],
+        "usernames": [], "login_success": False,
+        "login_attempts": 0, "files_downloaded": [],
+        "duration": 0, "start_time": None
+    })
+    raw_events = []
+
+    path = Path(filepath)
+    if not path.exists():
+        return {}, [], {}
+
+    with open(path, "r", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+                raw_events.append(e)
+                sid = e.get("session", "unknown")
+                eid = e.get("eventid", "")
+
+                if e.get("src_ip"):
+                    sessions[sid]["src_ip"] = e["src_ip"]
+
+                if eid == "cowrie.login.failed":
+                    sessions[sid]["login_attempts"] += 1
+                    sessions[sid]["passwords"].append(e.get("password", ""))
+                    sessions[sid]["usernames"].append(e.get("username", ""))
+                elif eid == "cowrie.login.success":
+                    sessions[sid]["login_success"] = True
+                elif eid == "cowrie.command.input":
+                    sessions[sid]["commands"].append(e.get("input", ""))
+                elif eid == "cowrie.session.file_download":
+                    sessions[sid]["files_downloaded"].append(e.get("url", ""))
+                elif eid == "cowrie.session.connect":
+                    sessions[sid]["start_time"] = e.get("timestamp")
+                elif eid == "cowrie.session.closed":
+                    sessions[sid]["duration"] = e.get("duration", 0)
+            except Exception:
+                continue
+
+    # Build stats
+    all_ips      = {s["src_ip"] for s in sessions.values() if s["src_ip"]}
+    all_commands = [c for s in sessions.values() for c in s["commands"]]
+    total_logins = sum(s["login_attempts"] for s in sessions.values())
+    total_dl     = sum(len(s["files_downloaded"]) for s in sessions.values())
+
+    dangerous = ["wget","curl","chmod","rm -rf","nc ","python","perl",
+                 "/etc/passwd","base64","nohup","crontab","bash -i","sh -i"]
+    dangerous_cmds = [c for c in all_commands if any(d in c for d in dangerous)]
+
+    stats = {
+        "total_sessions":   len(sessions),
+        "unique_ips":       len(all_ips),
+        "total_commands":   len(all_commands),
+        "login_attempts":   total_logins,
+        "files_downloaded": total_dl,
+        "dangerous_commands": len(dangerous_cmds),
+        "top_ips":          list(all_ips)[:10],
+        "sample_commands":  all_commands[:20],
+        "dangerous_list":   dangerous_cmds[:10],
+    }
+
+    return dict(sessions), raw_events, stats
+
+
+# ══════════════════════════════════════════════════════════════
+#  ROUTES
+# ══════════════════════════════════════════════════════════════
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+# ── Cowrie Control ────────────────────────────────────────────
+@app.route("/api/cowrie/status")
+def cowrie_status_route():
+    # Check if cowrie process is actually running
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "cowrie"],
+            capture_output=True, text=True
+        )
+        running = result.returncode == 0
+        cowrie_status["running"] = running
+    except Exception:
+        pass
+    return jsonify(cowrie_status)
+
+
+@app.route("/api/cowrie/start", methods=["POST"])
+def cowrie_start():
+    try:
+        bin_path = COWRIE_PATH / "bin" / "cowrie"
+
+        if bin_path.exists():
+            result = subprocess.run(
+                [str(bin_path), "start"],
+                capture_output=True, text=True, timeout=15,
+                cwd=str(COWRIE_PATH)
+            )
+        else:
+            # Fallback: activate virtualenv and start cowrie via bash
+            result = subprocess.run(
+                "source /home/cowrie/cowrie/cowrie-env/bin/activate && "
+                "cd /home/cowrie/cowrie && bin/cowrie start",
+                shell=True, executable="/bin/bash",
+                capture_output=True, text=True, timeout=15
+            )
+
+        # Verify process actually started
+        time.sleep(1)
+        check = subprocess.run(["pgrep", "-f", "cowrie"], capture_output=True, text=True)
+        running = check.returncode == 0
+
+        cowrie_status["running"] = running
+        if running:
+            cowrie_status["started"] = datetime.now().strftime("%H:%M:%S")
+            return jsonify({"success": True, "message": "Cowrie started successfully"})
+        else:
+            err = (result.stderr.strip() or result.stdout.strip() or
+                   "Process did not start — check Cowrie installation path")
+            return jsonify({"success": False, "message": err})
+
+    except subprocess.TimeoutExpired:
+        return jsonify({"success": False, "message": "Timed out waiting for Cowrie to start"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)})
+
+
+@app.route("/api/cowrie/stop", methods=["POST"])
+def cowrie_stop():
+    try:
+        bin_path = COWRIE_PATH / "bin" / "cowrie"
+
+        if bin_path.exists():
+            result = subprocess.run(
+                [str(bin_path), "stop"],
+                capture_output=True, text=True, timeout=10,
+                cwd=str(COWRIE_PATH)
+            )
+        else:
+            # Fallback: kill cowrie processes directly
+            result = subprocess.run(
+                ["pkill", "-f", "cowrie"],
+                capture_output=True, text=True, timeout=10
+            )
+
+        # Verify process actually stopped
+        time.sleep(1)
+        check = subprocess.run(["pgrep", "-f", "cowrie"], capture_output=True, text=True)
+        still_running = check.returncode == 0
+
+        if still_running:
+            return jsonify({"success": False,
+                            "message": "Cowrie is still running — try stopping manually with 'pkill -f cowrie'"})
+
+        cowrie_status["running"] = False
+        cowrie_status["started"] = None
+        return jsonify({"success": True, "message": "Cowrie stopped successfully"})
+
+    except subprocess.TimeoutExpired:
+        return jsonify({"success": False, "message": "Timed out waiting for Cowrie to stop"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)})
+
+
+# ── Live Log Stream (SSE) ─────────────────────────────────────
+@app.route("/api/logs/stream")
+def log_stream():
+    """Server-Sent Events — streams cowrie.json live."""
+    def generate():
+        # Always prefer live Cowrie log; only fall back to uploaded if live missing
+        if COWRIE_LOG.exists():
+            log_path = COWRIE_LOG
+        else:
+            log_path = LOG_DIR / "cowrie.json"
+
+        last_size = 0
+        while True:
+            try:
+                if log_path.exists():
+                    size = log_path.stat().st_size
+                    if size > last_size:
+                        with open(log_path, "r", errors="ignore") as f:
+                            f.seek(last_size)
+                            new_lines = f.read()
+                        last_size = size
+                        for line in new_lines.splitlines():
+                            if line.strip():
+                                try:
+                                    e = json.loads(line)
+                                    payload = json.dumps(e)
+                                    yield f"data: {payload}\n\n"
+                                except Exception:
+                                    pass
+            except Exception:
+                pass
+            time.sleep(0.2)
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache",
+                             "X-Accel-Buffering": "no"})
+
+
+# ── Upload Log ────────────────────────────────────────────────
+@app.route("/api/logs/upload", methods=["POST"])
+def upload_log():
+    if "file" not in request.files:
+        return jsonify({"success": False, "message": "No file"})
+    f = request.files["file"]
+    dest = LOG_DIR / "cowrie.json"
+    f.save(str(dest))
+
+    _, _, stats = parse_cowrie_json(dest)
+    return jsonify({"success": True, "stats": stats,
+                    "message": f"Uploaded {dest.stat().st_size} bytes"})
+
+
+# ── Dashboard Stats ───────────────────────────────────────────
+@app.route("/api/dashboard/stats")
+def dashboard_stats():
+    # Always prefer live Cowrie log; only fall back to uploaded if live missing
+    if COWRIE_LOG.exists():
+        log_path = COWRIE_LOG
+    else:
+        log_path = LOG_DIR / "cowrie.json"
+
+    _, _, stats = parse_cowrie_json(log_path)
+
+    # Add saved AI report info
+    reports = list(REPORT_DIR.glob("*.txt"))
+    stats["saved_reports"] = len(reports)
+
+    return jsonify(stats)
+
+
+# ── AI Analysis ───────────────────────────────────────────────
+@app.route("/api/analyze", methods=["POST"])
+def analyze():
+    global analysis_result
+    data   = request.get_json()
+    apikey = data.get("api_key", "").strip()
+
+    if not apikey:
+        return jsonify({"success": False, "message": "API key required"})
+
+    # Always prefer live Cowrie log; only fall back to uploaded if live missing
+    if COWRIE_LOG.exists():
+        log_path = COWRIE_LOG
+    elif (LOG_DIR / "cowrie.json").exists():
+        log_path = LOG_DIR / "cowrie.json"
+    else:
+        return jsonify({"success": False, "message": "No log file found. Upload a log first."})
+
+    analysis_result = {"report": "", "stats": {}, "done": False, "error": ""}
+
+    def run_analysis():
+        global analysis_result
+        try:
+            _, raw_events, stats = parse_cowrie_json(log_path)
+            analysis_result["stats"] = stats
+
+            # Build sample for AI
+            sample = json.dumps(raw_events[:30], indent=2)
+
+            prompt = f"""Analyze these Cowrie honeypot logs. Write a concise security report with these sections:
+LOG STATISTICS:
+- Total Sessions: {stats.get('total_sessions', 0)}
+- Unique Attacker IPs: {stats.get('unique_ips', 0)}
+- Total Login Attempts: {stats.get('login_attempts', 0)}
+- Commands Executed: {stats.get('total_commands', 0)}
+- Files Downloaded: {stats.get('files_downloaded', 0)}
+- Dangerous Commands: {stats.get('dangerous_commands', 0)}
+
+SAMPLE LOG EVENTS (first 60):
+{sample}
+
+Write a full security report with these sections:
+
+═══════════════════════════════════════
+  IOT HONEYPOT SECURITY ANALYSIS REPORT
+═══════════════════════════════════════
+
+1. EXECUTIVE SUMMARY
+2. ATTACK OVERVIEW & STATISTICS
+3. ATTACK TYPES IDENTIFIED
+4. ATTACKER IP ANALYSIS
+5. COMMAND & BEHAVIOR ANALYSIS
+6. DANGEROUS ACTIVITIES DETECTED
+7. ATTACKER SKILL LEVEL ASSESSMENT
+8. OVERALL SEVERITY: [CRITICAL/HIGH/MEDIUM/LOW]
+9. INDICATORS OF COMPROMISE (IoCs)
+10. DEFENSIVE RECOMMENDATIONS
+11. CONCLUSION
+
+Be technical, specific, and use actual data from the logs. Format clearly."""
+
+            genai.configure(api_key=apikey)        # 8 spaces
+            model    = genai.GenerativeModel("gemini-2.0-flash-lite")  # 8 spaces
+            response = model.generate_content(prompt) # 8 spaces
+            report   = response.text   
+            # Save report
+            ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
+            rpath   = REPORT_DIR / f"report_{ts}.txt"
+            header  = f"IoT Honeypot Security Report\nGenerated: {datetime.now()}\n{'='*60}\n\n"
+            rpath.write_text(header + report)
+
+            analysis_result["report"]    = report
+            analysis_result["done"]      = True
+            analysis_result["saved_to"]  = str(rpath)
+
+        except Exception as e:
+            analysis_result["error"] = str(e)
+            analysis_result["done"]  = True
+
+    threading.Thread(target=run_analysis, daemon=True).start()
+    return jsonify({"success": True, "message": "Analysis started"})
+
+
+@app.route("/api/analyze/result")
+def analyze_result():
+    return jsonify(analysis_result)
+
+
+# ── Download Report ───────────────────────────────────────────
+@app.route("/api/report/download")
+def download_report():
+    reports = sorted(REPORT_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not reports:
+        return jsonify({"error": "No report found"}), 404
+    return send_file(str(reports[0]), as_attachment=True,
+                     download_name=f"honeypot_report_{datetime.now().strftime('%Y%m%d')}.txt")
+
+
+@app.route("/api/report/latest")
+def latest_report():
+    reports = sorted(REPORT_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not reports:
+        return jsonify({"report": "", "exists": False})
+    return jsonify({"report": reports[0].read_text(), "exists": True,
+                    "name": reports[0].name})
+
+
+if __name__ == "__main__":
+    print("\n🛡️  IoT Honeypot GUI starting...")
+    print("📡  Open browser → http://localhost:5000\n")
+    app.run(debug=True, host="0.0.0.0", port=5000, threaded=True)

@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IoT Honeypot Control Center</title>
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&family=Exo+2:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <!-- External stylesheet -->
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- ══ TOP BAR ══════════════════════════════════════════════ -->
+<div class="topbar">
+  <div class="brand">🛡 IOT<span>HONEYPOT</span></div>
+  <div class="cowrie-ctl">
+    <div class="status-pill off" id="statusPill">
+      <div class="led"></div>
+      <span class="status-text" id="statusText">OFFLINE</span>
+    </div>
+    <button class="btn btn-start" id="btnStart" onclick="cowrieStart()">▶ Start</button>
+    <button class="btn btn-stop"  id="btnStop"  onclick="cowrieStop()" disabled>■ Stop</button>
+  </div>
+</div>
+
+<!-- ══ NAV ══════════════════════════════════════════════════ -->
+<div class="nav">
+  <div class="nav-tab active" onclick="goTo('dashboard')">📊 Dashboard</div>
+  <div class="nav-tab" onclick="goTo('live')">
+    📡 Live Logs
+    <span class="badge" id="liveBadge">0</span>
+  </div>
+  <div class="nav-tab" onclick="goTo('analyze')">🤖 AI Analyze</div>
+  <div class="nav-tab" onclick="goTo('report')">📄 Report</div>
+</div>
+
+<!-- ══ PAGES ═════════════════════════════════════════════════ -->
+<div class="main">
+
+  <!-- ── DASHBOARD ── -->
+  <div class="page active" id="page-dashboard">
+    <div class="stats-grid">
+      <div class="stat-box s1">
+        <div class="stat-val" id="dSessions">—</div>
+        <div class="stat-label">Sessions</div>
+      </div>
+      <div class="stat-box s2">
+        <div class="stat-val" id="dIPs">—</div>
+        <div class="stat-label">Unique IPs</div>
+      </div>
+      <div class="stat-box s3">
+        <div class="stat-val" id="dCommands">—</div>
+        <div class="stat-label">Commands</div>
+      </div>
+      <div class="stat-box s4">
+        <div class="stat-val" id="dLogins">—</div>
+        <div class="stat-label">Login Attempts</div>
+      </div>
+      <div class="stat-box s5">
+        <div class="stat-val" id="dDownloads">—</div>
+        <div class="stat-label">Downloads</div>
+      </div>
+      <div class="stat-box s6">
+        <div class="stat-val" id="dDangerous">—</div>
+        <div class="stat-label">Dangerous Cmds</div>
+      </div>
+    </div>
+
+    <div class="charts-row">
+      <div class="card">
+        <div class="card-title">Attack Distribution</div>
+        <canvas id="chartAttack" height="130"></canvas>
+      </div>
+      <div class="card">
+        <div class="card-title">Session Activity</div>
+        <canvas id="chartActivity" height="130"></canvas>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Top Attacker IPs</div>
+      <div id="topIPs" style="font-family:var(--mono);font-size:.82rem;line-height:2;color:var(--text);">
+        No data yet. Upload a log or let Cowrie collect attacks.
+      </div>
+    </div>
+  </div>
+
+  <!-- ── LIVE LOGS ── -->
+  <div class="page" id="page-live">
+    <div class="log-toolbar">
+      <input class="log-filter" id="logFilter" placeholder="Filter logs... (e.g. login, command, IP)" oninput="filterLogs()">
+      <button class="btn btn-ghost" onclick="clearLogs()">Clear</button>
+      <button class="btn btn-ghost" onclick="toggleAutoScroll()" id="btnScroll">⬇ Auto-scroll ON</button>
+      <span id="logCount" style="font-family:var(--mono);font-size:.75rem;color:var(--muted);margin-left:auto;">0 events</span>
+    </div>
+    <div class="log-terminal" id="logTerminal">
+      <div class="log-empty">
+        📡 Waiting for log events...<br>
+        <span style="font-size:.75rem;color:var(--muted)">Start Cowrie or upload a log file to see live events</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── AI ANALYZE ── -->
+  <div class="page" id="page-analyze">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+
+      <div>
+        <div class="card">
+          <div class="card-title">Upload Log File</div>
+          <div class="upload-area" id="uploadArea">
+            <input type="file" id="uploadInput" accept=".json,.log,.txt" onchange="handleUpload(this)">
+            <div class="upload-icon">📂</div>
+            <h3>Drop cowrie.json here</h3>
+            <p>or click to browse — .json / .log / .txt</p>
+          </div>
+          <div class="file-pill" id="filePill">
+            <span>📄</span>
+            <span class="fname" id="pillName">—</span>
+            <span class="fsize" id="pillSize">—</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Configuration</div>
+          <div class="api-row">
+            <div class="field">
+              <label>API Key</label>
+              <input type="password" id="apiKeyInput" placeholder="Enter your API key">
+            </div>
+          </div>
+          <button class="btn btn-primary" id="btnAnalyze" style="width:100%;padding:14px;"
+            onclick="startAnalysis()">⚡ ANALYZE WITH AI</button>
+
+          <div class="progress-wrap" id="progressWrap">
+            <div class="progress-label" id="progressLabel">Initializing...</div>
+            <div class="progress-track">
+              <div class="progress-bar pulse" id="progressBar"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="height:fit-content">
+        <div class="card-title">Quick Stats from Log</div>
+        <div id="quickStats" style="font-family:var(--mono);font-size:.82rem;line-height:2.2;color:var(--muted);">
+          Upload a log file to see quick stats.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── REPORT ── -->
+  <div class="page" id="page-report">
+    <div class="report-toolbar">
+      <button class="btn btn-primary" onclick="downloadReport()">⬇ Download Report</button>
+      <button class="btn btn-ghost"   onclick="loadLatestReport()">🔄 Refresh</button>
+      <span id="reportMeta" style="font-family:var(--mono);font-size:.75rem;color:var(--muted);margin-left:auto;"></span>
+    </div>
+    <div class="report-content" id="reportContent">
+      <div class="report-placeholder">
+        <div class="big">📄</div>
+        No report yet.<br>
+        <span style="font-size:.8rem;">Go to AI Analyze tab and run analysis first.</span>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<!-- External JavaScript -->
+<script src="/static/script.js"></script>
+
+</body>
+</html>

@@ -12,7 +12,7 @@ Flask + HTML/CSS Control Center for your IoT Honeypot project.
 
 ### 1. Install dependencies
 ```bash
-pip install flask anthropic
+pip install flask 
 ```
 
 ### 2. Run the app
@@ -33,7 +33,7 @@ http://localhost:5000
 4. **Report tab** — View and download the full AI report
 
 ## Getting Anthropic API Key
-1. Go to https://console.anthropic.com
+1. Go to https://aistudio.google.com
 2. Sign up / Login
 3. Create an API key
 4. Paste it in the AI Analyze tab

@@ -22,7 +22,7 @@ python app.py
 
 ### 3. Open browser
 ```
-http://localhost:5000
+https://iot-security-system-1-fpjy.onrender.com
 ```
 
 ## How to Use
